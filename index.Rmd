@@ -1,0 +1,114 @@
+---
+title: "Exercise correctness prediction"
+author: "Sebastián Rodríguez"
+date: "10/30/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Summary
+
+This report describes the creation of a model to predict if a training exercise was performed correctly based on accelerometer information. We train the model using the *Human Activity Recognition* dataset, the original publication can be found [here](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har). In order to comply with the word limit, all steps are briefly explained, but some of the code, outputs, and other tested models aren't shown. Using a **Random Forest** algorithm the model achieved *90%* predicted accuracy using cross validation.
+
+## Data processing
+
+```{r echo=FALSE, results='hide',warning=FALSE,message=FALSE}
+#Library load
+library(caret)
+library(ggplot2)
+library(doParallel)
+library(dplyr)
+#Dataset load
+
+# Basic code to download the required files and read them
+
+if(!file.exists("pml-testing.csv") || !file.exists("pml-training.csv")){
+        message("Dataset missing in working directory. Downloading...")
+        download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv","pml-training.csv",method="curl")
+        download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv","pml-testing.csv",method="curl")
+        if(!file.exists("pml-testing.csv") || !file.exists("pml-training.csv")){
+                stop("Download failed! Please retry later.")
+        }
+} else{
+        message("Dataset present in working directory, skipping download.")
+}
+
+trainingDataset <- read.csv("pml-training.csv")
+testingDataset <- read.csv("pml-testing.csv")
+```
+After loading the dataset, we see it has 19622 observations of 160 variables, with many NA values. The original [publication](http://web.archive.org/web/20170519033209/http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) mentions the data was summarized using a sliding window and augmented with calculated features. The *num_window* identifies all measurements that belong to the same window. Most observations have no calculated features, as they are intermediate measurements within the window (this happens for approximately *98%* of the rows). We drop these variables, as they are missing in the test set and thus can't be used to predict those values. 
+
+We average all measurements for each window, and drop the metadata for each observation (like the timestamp) to avoid overfitting to patterns specific to the data collection. For example: *num_window* indirectly encodes the result, as each window has only one class. If we fit a classifier (say, a Random Forest) using **only** *num_window* as predictor, we get 100% accuracy on the training set. We also get 100% accuracy on the test set, as all *num_window* values from the test set are also present in the training set and correctly fitted by the model during training.
+
+```{r results='hide',warning=FALSE,message=FALSE}
+tr <- trainingDataset
+tr[] <- lapply(tr,is.na)
+naSums <- apply(tr,2,sum)
+columnsToRemoveNA <- names(naSums[naSums>0])
+
+tr <- trainingDataset
+tr[] <- lapply(tr,function(x){is.character(x) & x == ""})
+emptySums <- apply(tr,2,sum)
+columnsToRemoveEmpty <- names(emptySums[emptySums>0])
+
+newTrainingDataset <- trainingDataset[,!names(trainingDataset) %in% c(columnsToRemoveNA,columnsToRemoveEmpty)]
+
+newTrainingDataset <- newTrainingDataset[,!names(newTrainingDataset) %in% c("user_name","cvtd_timestamp","new_window","raw_timestamp_part_2","raw_timestamp_part_1")]
+
+newTrainingDataset <- newTrainingDataset %>% group_by(num_window,classe) %>% summarise(across(everything(), mean))
+
+newTrainingDataset <- newTrainingDataset[,!names(newTrainingDataset) %in% c("num_window","X")]
+newTrainingDataset$classe <- as.factor(newTrainingDataset$classe)
+```
+
+All of this reduces the dataset from *160* columns to *54* (*53* predictors and the *classe* column) and the number of observations from *19622* to *858*.
+
+## Exploratory analysis
+
+After calculating the correlation matrix for all variables, we find that some are highly correlated (correlation > 0.8):
+
+```{r}
+
+correlations <- cor(newTrainingDataset[,!names(newTrainingDataset) %in% c("classe")])
+
+#remove the diagonal, as every variable is perfectly correlated with itself!
+diag(correlations) <- 0
+
+indices <- data.frame(which(correlations > 0.8,arr.ind=T))
+indices[,2] <- names(newTrainingDataset[,!names(newTrainingDataset) %in% c("classe")])[indices[,2]]
+colnames(indices)<-c("","Correlated with")
+print(indices[,-1,drop=FALSE])
+```
+Looking at the table, we see that many correlations are reasonable, for instance, *accel_belt_y.1* and *total_accel_belt*. At first blush, one could attempt to use *Principal Component Analysis* to remove the collinearity of these variables. However, after some testing this resulted in a reduction in accuracy. This may be caused by non-linear relationships between predictors that aren't captured by PCA (that is a linear method). In addition, Random Forests (our chosen algorithm) don't lose accuracy due to high correlations between variables, so we leave them as is.
+
+## Model creation
+
+After testing different algorithms (boosting, naive bayes, neural networks, etc), **Random Forest** was chosen for its improved accuracy and reasonable performance. To significantly speed up the process, the training was run in parallel using *doParallel*. The seed is set beforehand to make the results reproducible. We use 20-fold cross validation to train the model, as seen in the following code:
+
+```{r cache=TRUE}
+#for reproducibility
+set.seed(123456)
+
+#set CV
+tC <- trainControl(method = "cv", number = 20)
+
+#parallel execution of the training process
+cl <- makePSOCKcluster(8)
+registerDoParallel(cl)
+
+model <- train(classe~.,data=newTrainingDataset,method="rf",trControl=tC)
+
+stopCluster(cl)
+```
+## Results
+
+The resulting model has a *10.4%* out-of-sample error as estimated by *cross validation*:
+
+```{r}
+confusionMatrix.train(model)
+```
+
+This result also bears out in the testing set, getting 18/20 predictions right.
